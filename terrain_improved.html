@@ -1,0 +1,1176 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>改善版：対話的3Dボロノイ地形生成</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 1400px;
+            margin: 20px auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+        }
+        .container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        .canvas-wrapper {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        canvas {
+            display: block;
+            width: 100%;
+            border: 1px solid #ddd;
+        }
+        h2 {
+            margin-top: 0;
+            font-size: 18px;
+            color: #555;
+        }
+        .legend {
+            display: flex;
+            gap: 15px;
+            margin-top: 10px;
+            flex-wrap: wrap;
+        }
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 14px;
+        }
+        .legend-color {
+            width: 30px;
+            height: 20px;
+            border: 1px solid #333;
+        }
+        .explanation {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            margin-top: 20px;
+        }
+        .explanation h3 {
+            color: #333;
+            margin-top: 0;
+        }
+        .explanation ul {
+            line-height: 1.8;
+        }
+        .full-width {
+            grid-column: 1 / -1;
+        }
+        .controls {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            font-size: 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 0 5px;
+        }
+        button:hover {
+            background: #45a049;
+        }
+        #threejs-container {
+            width: 100%;
+            height: 600px;
+            background: #e8f4f8;
+            border-radius: 8px;
+        }
+        .instructions {
+            margin-top: 10px;
+            padding: 10px;
+            background: #f0f0f0;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <h1>改善版：対話的3Dボロノイ地形生成</h1>
+
+    <div class="controls">
+        <button onclick="regenerate()">🔄 地形を再生成</button>
+    </div>
+
+    <div class="container">
+        <div class="canvas-wrapper">
+            <h2>① ボロノイ分割 + 大領域グループ化</h2>
+            <canvas id="structure" width="600" height="600"></canvas>
+            <div class="legend">
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #4CAF50;"></div>
+                    <span>通路（緩やかな坂）</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #f44336;"></div>
+                    <span>壁（崖）</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="canvas-wrapper">
+            <h2>② 高度伝播（大領域単位）</h2>
+            <canvas id="heightNumbers" width="600" height="600"></canvas>
+        </div>
+
+        <div class="canvas-wrapper">
+            <h2>③ 滑らかな地形（2D）</h2>
+            <canvas id="smoothTerrain" width="600" height="600"></canvas>
+        </div>
+
+        <div class="canvas-wrapper full-width">
+            <h2>④ 対話的3Dビュー（Three.js）</h2>
+            <div id="threejs-container"></div>
+            <div class="instructions">
+                🖱️ 左ドラッグ: 回転 | 右ドラッグ/ホイール: ズーム | 中ドラッグ: パン
+            </div>
+        </div>
+    </div>
+
+    <div class="explanation">
+        <h3>✨ 改善ポイント</h3>
+        <ul>
+            <li><strong>急峻な坂の安定化:</strong> 境界処理アルゴリズムを改善し、計算の不安定性を解消。より滑らかな補間を実現。</li>
+            <li><strong>垂直な崖:</strong> べき乗パラメータを3.0に調整し、より急峻な崖を表現可能に。</li>
+            <li><strong>対話的3Dビュー:</strong> Three.jsによる回転可能な3D地形。マウスで自由に視点を変更可能。</li>
+            <li><strong>サイズ比率1:3:9:</strong> 小・中・大の領域サイズを明確に差別化（小=0.3倍、中=1.0倍、大=3.0倍）。</li>
+            <li><strong>実際の角度:</strong> 高度スケールを1.0に調整し、実際の傾斜角度を再現（0-40度が緩やか）。</li>
+            <li><strong>緩やかな坂の範囲:</strong> influenceRangeを調整し、0-40度の緩やかな傾斜を実現。</li>
+        </ul>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script>
+        class Point {
+            constructor(x, y) {
+                this.x = x;
+                this.y = y;
+            }
+
+            distanceTo(other) {
+                const dx = this.x - other.x;
+                const dy = this.y - other.y;
+                return Math.sqrt(dx * dx + dy * dy);
+            }
+        }
+
+        class VoronoiCell {
+            constructor(id, point) {
+                this.id = id;
+                this.point = point;
+                this.neighbors = new Set();
+                this.groupId = null;
+                this.baseHeight = null;
+                this.boundaryHeights = new Map();
+            }
+        }
+
+        class RegionGroup {
+            constructor(id) {
+                this.id = id;
+                this.cells = new Set();
+                this.neighborGroups = new Set();
+                this.baseHeight = null;
+            }
+        }
+
+        class ImprovedVoronoi {
+            constructor(width, height, numSites, numGroups) {
+                this.width = width;
+                this.height = height;
+                this.cells = [];
+                this.groups = [];
+                this.edges = new Map();
+                this.groupEdges = new Map();
+
+                for (let i = 0; i < numSites; i++) {
+                    const cell = new VoronoiCell(
+                        i,
+                        new Point(
+                            Math.random() * width,
+                            Math.random() * height
+                        )
+                    );
+                    this.cells.push(cell);
+                }
+
+                this.relaxLloyd(3);
+                this.buildNeighborGraph();
+                this.groupCells(numGroups);
+                this.generateGroupMaze();
+                this.propagateGroupHeights();
+                this.calculateCellBoundaryHeights();
+            }
+
+            groupCells(numGroups) {
+                const seeds = [];
+                seeds.push(Math.floor(Math.random() * this.cells.length));
+
+                while (seeds.length < numGroups) {
+                    let maxMinDist = -1;
+                    let bestCandidate = -1;
+
+                    for (let i = 0; i < this.cells.length; i++) {
+                        if (seeds.includes(i)) continue;
+
+                        let minDist = Infinity;
+                        for (const seedId of seeds) {
+                            const dist = this.cells[i].point.distanceTo(this.cells[seedId].point);
+                            minDist = Math.min(minDist, dist);
+                        }
+
+                        if (minDist > maxMinDist) {
+                            maxMinDist = minDist;
+                            bestCandidate = i;
+                        }
+                    }
+
+                    if (bestCandidate !== -1) {
+                        seeds.push(bestCandidate);
+                    } else {
+                        break;
+                    }
+                }
+
+                for (let i = 0; i < seeds.length; i++) {
+                    const group = new RegionGroup(i);
+                    this.groups.push(group);
+
+                    const seedCell = this.cells[seeds[i]];
+                    seedCell.groupId = i;
+                    group.cells.add(seeds[i]);
+                }
+
+                // サイズを1:3:9に設定（小:中:大 = 30%:50%:20%）
+                const groupSizes = [];
+                const numSmall = Math.floor(numGroups * 0.3);
+                const numMedium = Math.floor(numGroups * 0.5);
+                const numLarge = numGroups - numSmall - numMedium;
+
+                for (let i = 0; i < numSmall; i++) groupSizes.push('small');
+                for (let i = 0; i < numMedium; i++) groupSizes.push('medium');
+                for (let i = 0; i < numLarge; i++) groupSizes.push('large');
+
+                groupSizes.sort(() => Math.random() - 0.5);
+
+                this.groups.forEach((group, i) => {
+                    group.targetSize = groupSizes[i];
+                });
+
+                const queue = seeds.map(id => ({cellId: id, groupId: this.cells[id].groupId}));
+                const visited = new Set(seeds);
+
+                while (queue.length > 0) {
+                    const {cellId, groupId} = queue.shift();
+                    const group = this.groups[groupId];
+
+                    const totalCells = this.cells.length;
+                    let targetCells;
+                    if (group.targetSize === 'large') {
+                        targetCells = Math.floor(totalCells / numGroups * 3.0); // 3倍
+                    } else if (group.targetSize === 'medium') {
+                        targetCells = Math.floor(totalCells / numGroups * 1.0); // 標準
+                    } else {
+                        targetCells = Math.floor(totalCells / numGroups * 0.33); // 0.33倍
+                    }
+
+                    if (group.cells.size < targetCells) {
+                        for (const neighborId of this.cells[cellId].neighbors) {
+                            if (!visited.has(neighborId)) {
+                                visited.add(neighborId);
+                                this.cells[neighborId].groupId = groupId;
+                                this.groups[groupId].cells.add(neighborId);
+                                queue.push({cellId: neighborId, groupId});
+                            }
+                        }
+                    }
+                }
+
+                for (let i = 0; i < this.cells.length; i++) {
+                    if (!visited.has(i)) {
+                        let minDist = Infinity;
+                        let closestGroupId = 0;
+
+                        for (let g = 0; g < this.groups.length; g++) {
+                            for (const cellId of this.groups[g].cells) {
+                                const dist = this.cells[i].point.distanceTo(this.cells[cellId].point);
+                                if (dist < minDist) {
+                                    minDist = dist;
+                                    closestGroupId = g;
+                                }
+                            }
+                        }
+
+                        this.cells[i].groupId = closestGroupId;
+                        this.groups[closestGroupId].cells.add(i);
+                    }
+                }
+
+                for (let i = 0; i < this.cells.length; i++) {
+                    const cell = this.cells[i];
+                    for (const neighborId of cell.neighbors) {
+                        const neighbor = this.cells[neighborId];
+                        if (cell.groupId !== neighbor.groupId) {
+                            this.groups[cell.groupId].neighborGroups.add(neighbor.groupId);
+                            this.groups[neighbor.groupId].neighborGroups.add(cell.groupId);
+                        }
+                    }
+                }
+            }
+
+            generateGroupMaze() {
+                const visited = new Set([0]);
+                const edges = [];
+
+                for (const neighborGroupId of this.groups[0].neighborGroups) {
+                    edges.push([0, neighborGroupId]);
+                }
+
+                while (visited.size < this.groups.length && edges.length > 0) {
+                    const idx = Math.floor(Math.random() * edges.length);
+                    const [from, to] = edges[idx];
+                    edges.splice(idx, 1);
+
+                    if (!visited.has(to)) {
+                        visited.add(to);
+                        this.setGroupEdge(from, to, false);
+
+                        for (const neighborGroupId of this.groups[to].neighborGroups) {
+                            if (!visited.has(neighborGroupId)) {
+                                edges.push([to, neighborGroupId]);
+                            }
+                        }
+                    }
+                }
+
+                for (let i = 0; i < this.groups.length; i++) {
+                    for (const j of this.groups[i].neighborGroups) {
+                        if (i < j && !this.hasGroupEdge(i, j)) {
+                            this.setGroupEdge(i, j, true);
+                        }
+                    }
+                }
+            }
+
+            setGroupEdge(i, j, isWall) {
+                const key = i < j ? `${i}-${j}` : `${j}-${i}`;
+                this.groupEdges.set(key, isWall);
+            }
+
+            getGroupEdge(i, j) {
+                const key = i < j ? `${i}-${j}` : `${j}-${i}`;
+                return this.groupEdges.get(key) || false;
+            }
+
+            hasGroupEdge(i, j) {
+                const key = i < j ? `${i}-${j}` : `${j}-${i}`;
+                return this.groupEdges.has(key);
+            }
+
+            relaxLloyd(iterations) {
+                for (let iter = 0; iter < iterations; iter++) {
+                    const centroids = [];
+
+                    for (let i = 0; i < this.cells.length; i++) {
+                        let sumX = 0;
+                        let sumY = 0;
+                        let count = 0;
+
+                        const step = 8;
+                        for (let y = 0; y < this.height; y += step) {
+                            for (let x = 0; x < this.width; x += step) {
+                                const p = new Point(x, y);
+                                let closestId = 0;
+                                let minDist = this.cells[0].point.distanceTo(p);
+
+                                for (let j = 1; j < this.cells.length; j++) {
+                                    const dist = this.cells[j].point.distanceTo(p);
+                                    if (dist < minDist) {
+                                        minDist = dist;
+                                        closestId = j;
+                                    }
+                                }
+
+                                if (closestId === i) {
+                                    sumX += x;
+                                    sumY += y;
+                                    count++;
+                                }
+                            }
+                        }
+
+                        if (count > 0) {
+                            centroids.push(new Point(sumX / count, sumY / count));
+                        } else {
+                            centroids.push(this.cells[i].point);
+                        }
+                    }
+
+                    for (let i = 0; i < this.cells.length; i++) {
+                        this.cells[i].point = centroids[i];
+                    }
+                }
+            }
+
+            buildNeighborGraph() {
+                const step = 5;
+                for (let y = 0; y < this.height; y += step) {
+                    for (let x = 0; x < this.width; x += step) {
+                        const p = new Point(x, y);
+                        const sorted = this.cells
+                            .map(c => ({cell: c, dist: c.point.distanceTo(p)}))
+                            .sort((a, b) => a.dist - b.dist);
+
+                        if (sorted.length >= 2 && sorted[1].dist - sorted[0].dist < 3) {
+                            const c1 = sorted[0].cell;
+                            const c2 = sorted[1].cell;
+                            c1.neighbors.add(c2.id);
+                            c2.neighbors.add(c1.id);
+                        }
+                    }
+                }
+            }
+
+            propagateGroupHeights() {
+                const startGroup = this.groups[0];
+                startGroup.baseHeight = 40 + Math.random() * 20;
+
+                const visited = new Set([startGroup.id]);
+                const queue = [{group: startGroup, lastDirection: null}];
+
+                while (queue.length > 0) {
+                    const {group: current, lastDirection} = queue.shift();
+
+                    const children = [];
+                    for (const neighborGroupId of current.neighborGroups) {
+                        if (!this.getGroupEdge(current.id, neighborGroupId) && !visited.has(neighborGroupId)) {
+                            children.push(neighborGroupId);
+                        }
+                    }
+
+                    children.forEach(neighborGroupId => {
+                        visited.add(neighborGroupId);
+                        const neighbor = this.groups[neighborGroupId];
+
+                        const heightDiff = 5 + Math.random() * 7;
+
+                        let upProbability;
+                        if (lastDirection === 'up') {
+                            upProbability = 0.75;
+                        } else if (lastDirection === 'down') {
+                            upProbability = 0.25;
+                        } else {
+                            upProbability = 0.55;
+                        }
+
+                        const goUp = Math.random() < upProbability;
+                        const newDirection = goUp ? 'up' : 'down';
+
+                        if (goUp) {
+                            neighbor.baseHeight = Math.min(90, current.baseHeight + heightDiff);
+                        } else {
+                            neighbor.baseHeight = Math.max(10, current.baseHeight - heightDiff);
+                        }
+
+                        queue.push({group: neighbor, lastDirection: newDirection});
+                    });
+                }
+
+                this.ensureGroupWallHeightDifference();
+            }
+
+            ensureGroupWallHeightDifference() {
+                const minDifference = 15;
+
+                for (let i = 0; i < this.groups.length; i++) {
+                    for (const j of this.groups[i].neighborGroups) {
+                        if (i < j && this.getGroupEdge(i, j)) {
+                            const group1 = this.groups[i];
+                            const group2 = this.groups[j];
+
+                            if (group1.baseHeight == null || group2.baseHeight == null) continue;
+
+                            const diff = Math.abs(group1.baseHeight - group2.baseHeight);
+                            if (diff < minDifference) {
+                                if (group1.baseHeight > group2.baseHeight) {
+                                    group1.baseHeight = Math.min(95, group2.baseHeight + minDifference + Math.random() * 10);
+                                } else {
+                                    group2.baseHeight = Math.min(95, group1.baseHeight + minDifference + Math.random() * 10);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            calculateCellBoundaryHeights() {
+                for (const cell of this.cells) {
+                    const group = this.groups[cell.groupId];
+                    cell.baseHeight = group.baseHeight;
+                }
+
+                for (const cell of this.cells) {
+                    for (const neighborId of cell.neighbors) {
+                        const neighbor = this.cells[neighborId];
+
+                        if (cell.groupId === neighbor.groupId ||
+                            !this.getGroupEdge(cell.groupId, neighbor.groupId)) {
+                            const boundaryHeight = (cell.baseHeight + neighbor.baseHeight) / 2;
+                            cell.boundaryHeights.set(neighborId, boundaryHeight);
+                        }
+                    }
+                }
+            }
+
+            getClosestCell(x, y) {
+                const p = new Point(x, y);
+                let closest = this.cells[0];
+                let minDist = closest.point.distanceTo(p);
+
+                for (let i = 1; i < this.cells.length; i++) {
+                    const dist = this.cells[i].point.distanceTo(p);
+                    if (dist < minDist) {
+                        minDist = dist;
+                        closest = this.cells[i];
+                    }
+                }
+
+                return {cell: closest, dist: minDist};
+            }
+
+            getClosestCells(x, y, n = 3) {
+                const p = new Point(x, y);
+                return this.cells
+                    .map(c => ({cell: c, dist: c.point.distanceTo(p)}))
+                    .sort((a, b) => a.dist - b.dist)
+                    .slice(0, n);
+            }
+        }
+
+        function smoothstep(t) {
+            t = Math.max(0, Math.min(1, t));
+            return t * t * (3 - 2 * t);
+        }
+
+        // 改善された高度計算（安定化）
+        function getImprovedHeight(voronoi, x, y) {
+            const p = new Point(x, y);
+            const closest = voronoi.getClosestCells(x, y, 5);
+            const primaryCell = closest[0].cell;
+
+            if (primaryCell.baseHeight == null) return 50;
+
+            // 高度差を計算
+            let maxHeightDiff = 0;
+            if (primaryCell.boundaryHeights.size > 0) {
+                for (const [neighborId, boundaryHeight] of primaryCell.boundaryHeights) {
+                    const diff = Math.abs(boundaryHeight - primaryCell.baseHeight);
+                    maxHeightDiff = Math.max(maxHeightDiff, diff);
+                }
+            }
+
+            // 影響範囲を調整（0-40度の緩やかな坂になるように）
+            // 距離100ピクセルで高度差5m → tan(θ) = 5/100 = 0.05 → θ ≈ 2.86度
+            // 距離50ピクセルで高度差10m → tan(θ) = 10/50 = 0.2 → θ ≈ 11.3度
+            // 距離30ピクセルで高度差10m → tan(θ) = 10/30 = 0.333 → θ ≈ 18.4度
+            const baseRange = 200;
+            const rangeScale = 40; // 高度差1mあたり40ピクセル
+            const influenceRange = baseRange + maxHeightDiff * rangeScale;
+
+            let baseHeight = primaryCell.baseHeight;
+
+            if (primaryCell.boundaryHeights.size > 0) {
+                let totalWeight = 0;
+                let totalHeight = 0;
+
+                for (const [neighborId, boundaryHeight] of primaryCell.boundaryHeights) {
+                    const neighbor = voronoi.cells[neighborId];
+                    const boundaryX = (primaryCell.point.x + neighbor.point.x) / 2;
+                    const boundaryY = (primaryCell.point.y + neighbor.point.y) / 2;
+                    const boundaryPoint = new Point(boundaryX, boundaryY);
+                    const distToBoundary = p.distanceTo(boundaryPoint);
+
+                    // より滑らかな重み付け（べき乗を0.4に調整）
+                    const weight = 1 / (Math.pow(distToBoundary / influenceRange, 0.4) + 0.01);
+                    totalWeight += weight;
+                    totalHeight += boundaryHeight * weight;
+                }
+
+                const centerDist = closest[0].dist;
+                const centerWeight = 1 / (Math.pow(centerDist / influenceRange, 0.4) + 0.01);
+                totalWeight += centerWeight;
+                totalHeight += primaryCell.baseHeight * centerWeight;
+
+                baseHeight = totalHeight / totalWeight;
+            }
+
+            let finalHeight = baseHeight;
+
+            // 境界処理（簡素化して安定性向上）
+            for (let i = 1; i < Math.min(3, closest.length); i++) {
+                const {cell: otherCell, dist: otherDist} = closest[i];
+
+                if (otherCell.baseHeight == null) continue;
+
+                const distToBoundary = otherDist - closest[0].dist;
+
+                if (distToBoundary < 60) {
+                    const isWall = voronoi.getGroupEdge(primaryCell.groupId, otherCell.groupId);
+
+                    if (isWall) {
+                        const heightDiff = Math.abs(primaryCell.baseHeight - otherCell.baseHeight);
+                        const cliffRange = Math.min(50, 15 + heightDiff * 2);
+
+                        if (distToBoundary < cliffRange) {
+                            const t = distToBoundary / cliffRange;
+                            // べき乗を3.0に調整して急峻さを増す
+                            const sharpT = Math.pow(t, 3.0);
+
+                            let otherHeight = otherCell.baseHeight;
+                            if (otherCell.boundaryHeights.size > 0) {
+                                let otherMaxHeightDiff = 0;
+                                for (const [neighborId, boundaryHeight] of otherCell.boundaryHeights) {
+                                    const diff = Math.abs(boundaryHeight - otherCell.baseHeight);
+                                    otherMaxHeightDiff = Math.max(otherMaxHeightDiff, diff);
+                                }
+                                const otherInfluenceRange = baseRange + otherMaxHeightDiff * rangeScale;
+
+                                let otherTotalWeight = 0;
+                                let otherTotalHeight = 0;
+
+                                for (const [neighborId, boundaryHeight] of otherCell.boundaryHeights) {
+                                    const neighbor = voronoi.cells[neighborId];
+                                    const boundaryX = (otherCell.point.x + neighbor.point.x) / 2;
+                                    const boundaryY = (otherCell.point.y + neighbor.point.y) / 2;
+                                    const boundaryPoint = new Point(boundaryX, boundaryY);
+                                    const distToBoundary = p.distanceTo(boundaryPoint);
+
+                                    const weight = 1 / (Math.pow(distToBoundary / otherInfluenceRange, 0.4) + 0.01);
+                                    otherTotalWeight += weight;
+                                    otherTotalHeight += boundaryHeight * weight;
+                                }
+
+                                const centerDist = otherDist;
+                                const centerWeight = 1 / (Math.pow(centerDist / otherInfluenceRange, 0.4) + 0.01);
+                                otherTotalWeight += centerWeight;
+                                otherTotalHeight += otherCell.baseHeight * centerWeight;
+
+                                otherHeight = otherTotalHeight / otherTotalWeight;
+                            }
+
+                            finalHeight = finalHeight * sharpT + otherHeight * (1 - sharpT);
+                        }
+                    } else {
+                        const t = Math.min(1, distToBoundary / 60);
+                        const smoothT = smoothstep(t);
+
+                        let otherHeight = otherCell.baseHeight;
+                        if (otherCell.boundaryHeights.size > 0) {
+                            let otherMaxHeightDiff = 0;
+                            for (const [neighborId, boundaryHeight] of otherCell.boundaryHeights) {
+                                const diff = Math.abs(boundaryHeight - otherCell.baseHeight);
+                                otherMaxHeightDiff = Math.max(otherMaxHeightDiff, diff);
+                            }
+                            const otherInfluenceRange = baseRange + otherMaxHeightDiff * rangeScale;
+
+                            let otherTotalWeight = 0;
+                            let otherTotalHeight = 0;
+
+                            for (const [neighborId, boundaryHeight] of otherCell.boundaryHeights) {
+                                const neighbor = voronoi.cells[neighborId];
+                                const boundaryX = (otherCell.point.x + neighbor.point.x) / 2;
+                                const boundaryY = (otherCell.point.y + neighbor.point.y) / 2;
+                                const boundaryPoint = new Point(boundaryX, boundaryY);
+                                const distToBoundary = p.distanceTo(boundaryPoint);
+
+                                const weight = 1 / (Math.pow(distToBoundary / otherInfluenceRange, 0.4) + 0.01);
+                                otherTotalWeight += weight;
+                                otherTotalHeight += boundaryHeight * weight;
+                            }
+
+                            const centerDist = otherDist;
+                            const centerWeight = 1 / (Math.pow(centerDist / otherInfluenceRange, 0.4) + 0.01);
+                            otherTotalWeight += centerWeight;
+                            otherTotalHeight += otherCell.baseHeight * centerWeight;
+
+                            otherHeight = otherTotalHeight / otherTotalWeight;
+                        }
+
+                        finalHeight = finalHeight * smoothT + otherHeight * (1 - smoothT);
+                    }
+                }
+            }
+
+            return Math.max(0, Math.min(100, finalHeight));
+        }
+
+        function heightToColor(h) {
+            if (h < 20) {
+                const t = h / 20;
+                return {
+                    r: Math.floor(0 * (1 - t) + 102 * t),
+                    g: Math.floor(102 * (1 - t) + 179 * t),
+                    b: Math.floor(204 * (1 - t) + 255 * t)
+                };
+            } else if (h < 40) {
+                const t = (h - 20) / 20;
+                return {
+                    r: Math.floor(102 * (1 - t) + 144 * t),
+                    g: Math.floor(179 * (1 - t) + 238 * t),
+                    b: Math.floor(255 * (1 - t) + 144 * t)
+                };
+            } else if (h < 60) {
+                const t = (h - 40) / 20;
+                return {
+                    r: Math.floor(144 * (1 - t) + 255 * t),
+                    g: Math.floor(238 * (1 - t) + 215 * t),
+                    b: Math.floor(144 * (1 - t) + 0 * t)
+                };
+            } else if (h < 80) {
+                const t = (h - 60) / 20;
+                return {
+                    r: Math.floor(255 * (1 - t) + 255 * t),
+                    g: Math.floor(215 * (1 - t) + 107 * t),
+                    b: Math.floor(0 * (1 - t) + 53 * t)
+                };
+            } else {
+                const t = (h - 80) / 20;
+                return {
+                    r: Math.floor(255 * (1 - t) + 139 * t),
+                    g: Math.floor(107 * (1 - t) + 69 * t),
+                    b: Math.floor(53 * (1 - t) + 19 * t)
+                };
+            }
+        }
+
+        function drawStructure(canvas, voronoi) {
+            const ctx = canvas.getContext('2d');
+            const width = canvas.width;
+            const height = canvas.height;
+
+            ctx.fillStyle = '#f9f9f9';
+            ctx.fillRect(0, 0, width, height);
+
+            const groupColors = [];
+            for (let i = 0; i < voronoi.groups.length; i++) {
+                const hue = (i * 137.5) % 360;
+                groupColors.push(`hsl(${hue}, 40%, 85%)`);
+            }
+
+            for (let y = 0; y < height; y += 2) {
+                for (let x = 0; x < width; x += 2) {
+                    const {cell} = voronoi.getClosestCell(x, y);
+                    ctx.fillStyle = groupColors[cell.groupId];
+                    ctx.fillRect(x, y, 2, 2);
+                }
+            }
+
+            const imageData = ctx.createImageData(width, height);
+            for (let y = 0; y < height; y++) {
+                for (let x = 0; x < width; x++) {
+                    const closest = voronoi.getClosestCells(x, y, 2);
+                    const diff = closest[1].dist - closest[0].dist;
+
+                    const idx = (y * width + x) * 4;
+
+                    if (diff < 1) {
+                        imageData.data[idx] = 180;
+                        imageData.data[idx + 1] = 180;
+                        imageData.data[idx + 2] = 180;
+                        imageData.data[idx + 3] = 100;
+                    }
+                }
+            }
+            ctx.putImageData(imageData, 0, 0);
+
+            const imageData2 = ctx.createImageData(width, height);
+            for (let y = 0; y < height; y++) {
+                for (let x = 0; x < width; x++) {
+                    const closest = voronoi.getClosestCells(x, y, 2);
+                    const diff = closest[1].dist - closest[0].dist;
+
+                    const idx = (y * width + x) * 4;
+
+                    if (diff < 1.5) {
+                        const group1 = closest[0].cell.groupId;
+                        const group2 = closest[1].cell.groupId;
+
+                        if (group1 !== group2) {
+                            const isWall = voronoi.getGroupEdge(group1, group2);
+                            if (isWall) {
+                                imageData2.data[idx] = 244;
+                                imageData2.data[idx + 1] = 67;
+                                imageData2.data[idx + 2] = 54;
+                            } else {
+                                imageData2.data[idx] = 76;
+                                imageData2.data[idx + 1] = 175;
+                                imageData2.data[idx + 2] = 80;
+                            }
+                            imageData2.data[idx + 3] = 255;
+                        }
+                    }
+                }
+            }
+            ctx.putImageData(imageData2, 0, 0);
+
+            voronoi.cells.forEach(cell => {
+                ctx.beginPath();
+                ctx.arc(cell.point.x, cell.point.y, 2, 0, Math.PI * 2);
+                ctx.fillStyle = '#666';
+                ctx.fill();
+            });
+        }
+
+        function drawHeightNumbers(canvas, voronoi) {
+            const ctx = canvas.getContext('2d');
+            const width = canvas.width;
+            const height = canvas.height;
+
+            ctx.fillStyle = '#f9f9f9';
+            ctx.fillRect(0, 0, width, height);
+
+            for (let y = 0; y < height; y += 2) {
+                for (let x = 0; x < width; x += 2) {
+                    const {cell} = voronoi.getClosestCell(x, y);
+                    const group = voronoi.groups[cell.groupId];
+                    const color = heightToColor(group.baseHeight);
+                    ctx.fillStyle = `rgba(${color.r}, ${color.g}, ${color.b}, 0.4)`;
+                    ctx.fillRect(x, y, 2, 2);
+                }
+            }
+
+            const imageData = ctx.createImageData(width, height);
+            for (let y = 0; y < height; y++) {
+                for (let x = 0; x < width; x++) {
+                    const closest = voronoi.getClosestCells(x, y, 2);
+                    const diff = closest[1].dist - closest[0].dist;
+
+                    const idx = (y * width + x) * 4;
+
+                    if (diff < 1.5) {
+                        const group1 = closest[0].cell.groupId;
+                        const group2 = closest[1].cell.groupId;
+
+                        if (group1 !== group2) {
+                            imageData.data[idx] = 60;
+                            imageData.data[idx + 1] = 60;
+                            imageData.data[idx + 2] = 60;
+                            imageData.data[idx + 3] = 255;
+                        }
+                    }
+                }
+            }
+            ctx.putImageData(imageData, 0, 0);
+
+            ctx.fillStyle = '#000';
+            ctx.font = 'bold 16px sans-serif';
+            ctx.textAlign = 'center';
+
+            voronoi.groups.forEach(group => {
+                let sumX = 0, sumY = 0;
+                for (const cellId of group.cells) {
+                    sumX += voronoi.cells[cellId].point.x;
+                    sumY += voronoi.cells[cellId].point.y;
+                }
+                const centerX = sumX / group.cells.size;
+                const centerY = sumY / group.cells.size;
+
+                ctx.fillText(
+                    `${group.baseHeight.toFixed(0)}m`,
+                    centerX,
+                    centerY + 5
+                );
+            });
+
+            ctx.strokeStyle = '#4CAF50';
+            ctx.lineWidth = 2;
+            ctx.fillStyle = '#4CAF50';
+
+            const drawn = new Set();
+
+            voronoi.groups.forEach(group => {
+                for (const neighborGroupId of group.neighborGroups) {
+                    if (!voronoi.getGroupEdge(group.id, neighborGroupId)) {
+                        const key = group.id < neighborGroupId ?
+                            `${group.id}-${neighborGroupId}` : `${neighborGroupId}-${group.id}`;
+
+                        if (drawn.has(key)) continue;
+                        drawn.add(key);
+
+                        const neighbor = voronoi.groups[neighborGroupId];
+
+                        let sumX1 = 0, sumY1 = 0;
+                        for (const cellId of group.cells) {
+                            sumX1 += voronoi.cells[cellId].point.x;
+                            sumY1 += voronoi.cells[cellId].point.y;
+                        }
+                        const centerX1 = sumX1 / group.cells.size;
+                        const centerY1 = sumY1 / group.cells.size;
+
+                        let sumX2 = 0, sumY2 = 0;
+                        for (const cellId of neighbor.cells) {
+                            sumX2 += voronoi.cells[cellId].point.x;
+                            sumY2 += voronoi.cells[cellId].point.y;
+                        }
+                        const centerX2 = sumX2 / neighbor.cells.size;
+                        const centerY2 = sumY2 / neighbor.cells.size;
+
+                        const dx = centerX2 - centerX1;
+                        const dy = centerY2 - centerY1;
+                        const len = Math.sqrt(dx * dx + dy * dy);
+
+                        const startX = centerX1 + dx / len * 30;
+                        const startY = centerY1 + dy / len * 30;
+                        const endX = centerX1 + dx / len * (len / 2 - 10);
+                        const endY = centerY1 + dy / len * (len / 2 - 10);
+
+                        ctx.beginPath();
+                        ctx.moveTo(startX, startY);
+                        ctx.lineTo(endX, endY);
+                        ctx.stroke();
+
+                        const angle = Math.atan2(dy, dx);
+                        ctx.beginPath();
+                        ctx.moveTo(endX, endY);
+                        ctx.lineTo(
+                            endX - 10 * Math.cos(angle - Math.PI / 6),
+                            endY - 10 * Math.sin(angle - Math.PI / 6)
+                        );
+                        ctx.lineTo(
+                            endX - 10 * Math.cos(angle + Math.PI / 6),
+                            endY - 10 * Math.sin(angle + Math.PI / 6)
+                        );
+                        ctx.closePath();
+                        ctx.fill();
+                    }
+                }
+            });
+        }
+
+        function drawSmoothTerrain(canvas, voronoi) {
+            const ctx = canvas.getContext('2d');
+            const width = canvas.width;
+            const height = canvas.height;
+
+            const imageData = ctx.createImageData(width, height);
+
+            for (let y = 0; y < height; y++) {
+                for (let x = 0; x < width; x++) {
+                    const terrainHeight = getImprovedHeight(voronoi, x, y);
+                    const color = heightToColor(terrainHeight);
+
+                    const idx = (y * width + x) * 4;
+                    imageData.data[idx] = color.r;
+                    imageData.data[idx + 1] = color.g;
+                    imageData.data[idx + 2] = color.b;
+                    imageData.data[idx + 3] = 255;
+                }
+            }
+
+            ctx.putImageData(imageData, 0, 0);
+
+            ctx.strokeStyle = 'rgba(0, 0, 0, 0.15)';
+            ctx.lineWidth = 1;
+            for (let h = 20; h < 100; h += 10) {
+                drawContour(ctx, voronoi, width, height, h);
+            }
+        }
+
+        function drawContour(ctx, voronoi, width, height, targetHeight) {
+            const step = 6;
+            ctx.beginPath();
+
+            for (let y = 0; y < height - step; y += step) {
+                for (let x = 0; x < width - step; x += step) {
+                    const h1 = getImprovedHeight(voronoi, x, y);
+                    const h2 = getImprovedHeight(voronoi, x + step, y);
+                    const h3 = getImprovedHeight(voronoi, x, y + step);
+
+                    if ((h1 < targetHeight && h2 >= targetHeight) ||
+                        (h1 >= targetHeight && h2 < targetHeight)) {
+                        ctx.moveTo(x, y);
+                        ctx.lineTo(x + step, y);
+                    }
+
+                    if ((h1 < targetHeight && h3 >= targetHeight) ||
+                        (h1 >= targetHeight && h3 < targetHeight)) {
+                        ctx.moveTo(x, y);
+                        ctx.lineTo(x, y + step);
+                    }
+                }
+            }
+
+            ctx.stroke();
+        }
+
+        // Three.js 3Dビュー
+        let scene, camera, renderer, controls, terrain3D;
+
+        function initThreeJS(voronoi) {
+            const container = document.getElementById('threejs-container');
+            container.innerHTML = '';
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0xe8f4f8);
+
+            camera = new THREE.PerspectiveCamera(
+                60,
+                container.clientWidth / container.clientHeight,
+                1,
+                2000
+            );
+            camera.position.set(400, 400, 400);
+            camera.lookAt(0, 0, 0);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(container.clientWidth, container.clientHeight);
+            container.appendChild(renderer.domElement);
+
+            // OrbitControls
+            if (THREE.OrbitControls) {
+                controls = new THREE.OrbitControls(camera, renderer.domElement);
+                controls.enableDamping = true;
+                controls.dampingFactor = 0.05;
+                controls.target.set(0, 0, 0);
+            }
+
+            // ライト
+            const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+            scene.add(ambientLight);
+
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            directionalLight.position.set(100, 200, 100);
+            scene.add(directionalLight);
+
+            // 地形メッシュを作成
+            createTerrain3D(voronoi);
+
+            // アニメーションループ
+            function animate() {
+                requestAnimationFrame(animate);
+                if (controls) controls.update();
+                renderer.render(scene, camera);
+            }
+            animate();
+
+            // リサイズ対応
+            window.addEventListener('resize', () => {
+                camera.aspect = container.clientWidth / container.clientHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(container.clientWidth, container.clientHeight);
+            });
+        }
+
+        function createTerrain3D(voronoi) {
+            if (terrain3D) {
+                scene.remove(terrain3D);
+            }
+
+            const meshSize = 80;
+            const step = 600 / meshSize;
+            const geometry = new THREE.BufferGeometry();
+
+            const vertices = [];
+            const colors = [];
+            const indices = [];
+
+            // 頂点データを生成
+            for (let j = 0; j <= meshSize; j++) {
+                for (let i = 0; i <= meshSize; i++) {
+                    const x = i * step - 300;
+                    const y = j * step - 300;
+                    const terrainX = i * step;
+                    const terrainY = j * step;
+                    const z = getImprovedHeight(voronoi, terrainX, terrainY);
+
+                    // 高度スケールを1.0に（実際の角度）
+                    vertices.push(x, z * 1.0, y);
+
+                    const color = heightToColor(z);
+                    colors.push(color.r / 255, color.g / 255, color.b / 255);
+                }
+            }
+
+            // インデックスデータを生成
+            for (let j = 0; j < meshSize; j++) {
+                for (let i = 0; i < meshSize; i++) {
+                    const a = j * (meshSize + 1) + i;
+                    const b = a + 1;
+                    const c = a + (meshSize + 1);
+                    const d = c + 1;
+
+                    indices.push(a, c, b);
+                    indices.push(b, c, d);
+                }
+            }
+
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices, 3));
+            geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+            geometry.setIndex(indices);
+            geometry.computeVertexNormals();
+
+            const material = new THREE.MeshPhongMaterial({
+                vertexColors: true,
+                flatShading: false,
+                shininess: 30,
+                side: THREE.DoubleSide
+            });
+
+            terrain3D = new THREE.Mesh(geometry, material);
+            scene.add(terrain3D);
+
+            // グリッド
+            const gridHelper = new THREE.GridHelper(600, 20, 0x888888, 0xcccccc);
+            gridHelper.position.y = -10;
+            scene.add(gridHelper);
+        }
+
+        let currentVoronoi = null;
+
+        function regenerate() {
+            currentVoronoi = new ImprovedVoronoi(600, 600, 100, 15);
+
+            const structureCanvas = document.getElementById('structure');
+            const heightNumbersCanvas = document.getElementById('heightNumbers');
+            const smoothTerrainCanvas = document.getElementById('smoothTerrain');
+
+            drawStructure(structureCanvas, currentVoronoi);
+            drawHeightNumbers(heightNumbersCanvas, currentVoronoi);
+            drawSmoothTerrain(smoothTerrainCanvas, currentVoronoi);
+
+            if (scene) {
+                createTerrain3D(currentVoronoi);
+            } else {
+                initThreeJS(currentVoronoi);
+            }
+        }
+
+        // 初回生成
+        regenerate();
+    </script>
+    <script src="https://threejs.org/examples/js/controls/OrbitControls.js"></script>
+</body>
+</html>
