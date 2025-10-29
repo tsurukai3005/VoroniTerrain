@@ -1,16 +1,12 @@
 """
-ボクセルベース地形生成(改善版v13)
+ボクセルベース地形生成
 
-改善ポイント(v13):
-1. **マップを4倍に拡張**: 400×400、母点800個、グループ80個に拡大
-2. **基準点を左上中心に設定**: (width/4, height/4)を基準点として、近づく→上昇70%、離れる→下降70%
-3. **基準点の可視化**: 赤い星印で基準点を表示
-4. **長い境界を優先的に通路に割り当て**: 境界線の長さを計算し、重み付きランダム選択で長い境界ほど通路になりやすく
-5. **パーリンノイズによる細かなディテール**: 完成した高度マップに複数オクターブのパーリンノイズを重ねて自然な凹凸を追加
-6. **迷路生成の通路/壁を維持**: 高度による再判定を削除し、迷路アルゴリズムで決定された通路/壁をそのまま使用
-7. **高度変化**: 1-2.5mの緩やかな変化を維持
-8. **中央平坦化**: 領域中央は平坦、境界付近のみ傾斜
-9. **崖の維持**: 迷路で壁とされた境界は崖として機能
+主要機能:
+- Voronoi分割による領域生成
+- 迷路アルゴリズムによる通路/崖の配置
+- 垂直な崖となめらかな坂の生成
+- 距離ベースの高度差調整(0-40度の傾斜)
+- パーリンノイズによる自然な凹凸
 """
 
 import numpy as np
@@ -25,6 +21,73 @@ from scipy.ndimage import gaussian_filter
 # 日本語フォント設定(Windows環境)
 plt.rcParams['font.family'] = ['Yu Gothic', 'MS Gothic', 'DejaVu Sans']
 plt.rcParams['axes.unicode_minus'] = False
+
+# ========================================
+# 地形生成パラメータ設定
+# ========================================
+
+class TerrainConfig:
+    """地形生成のパラメータを一元管理するクラス"""
+
+    # === マップサイズ設定 ===
+    MAP_WIDTH = 400           # マップの幅(ピクセル)
+    MAP_HEIGHT = 400          # マップの高さ(ピクセル)
+    NUM_VORONOI_SITES = 400   # Voronoi分割の母点数(セル数)
+    NUM_GROUPS = 50           # グループ数(領域数)
+
+    # === Lloyd緩和設定 ===
+    LLOYD_ITERATIONS = 3      # Lloyd緩和の反復回数(均等な点配置のため)
+
+    # === 高度設定 ===
+    INITIAL_HEIGHT = 40.0     # 初期高度(m)
+    MIN_HEIGHT = 20.0         # 最低高度(m)
+    MAX_HEIGHT = 80.0         # 最高高度(m)
+
+    # === 基準点設定 ===
+    # 高度の上昇/下降判定の基準点(左上中心)
+    REFERENCE_POINT_X_RATIO = 0.25  # マップ幅の1/4の位置
+    REFERENCE_POINT_Y_RATIO = 0.25  # マップ高さの1/4の位置
+
+    # === 高度変化の確率設定 ===
+    # 基準点に近づく場合の上昇確率(基準値)
+    PROB_UP_APPROACHING = 0.80      # 80%で上昇
+    # 基準点から離れる場合の上昇確率(基準値)
+    PROB_UP_RECEDING = 0.20         # 20%で上昇
+
+    # === 高度ベースの確率調整 ===
+    HEIGHT_PROB_THRESHOLD_HIGH = 75.0  # この高度以上で下降しやすくなる(m)
+    HEIGHT_PROB_THRESHOLD_LOW = 25.0   # この高度以下で上昇しやすくなる(m)
+    HEIGHT_PROB_ADJUSTMENT = 0.30      # 確率調整の幅(±30%)
+
+    # === 傾斜角度設定 ===
+    MAX_SLOPE_ANGLE = 30.0    # 坂の最大傾斜角度(度)
+    MIN_SLOPE_ANGLE = 0.0     # 坂の最小傾斜角度(度)
+
+    # === 境界距離設定 ===
+    FLAT_CENTER_DISTANCE = 30.0  # この距離以上離れた中央部は完全平坦(px)
+
+    # === 崖(壁)の設定 ===
+    CLIFF_RANGE = 5.0         # 崖の影響範囲(px) - 垂直に近い変化
+    CLIFF_POWER = 0.1         # 崖の変化曲線(べき乗) - 小さいほど垂直に近い
+
+    # === 坂(通路)の設定 ===
+    SLOPE_RANGE = 50.0        # 坂の影響範囲(px) - 緩やかな変化
+    SLOPE_POWER = 1.5         # 坂の変化曲線(べき乗) - 大きいほど緩やか
+
+    # === パーリンノイズ設定 ===
+    NOISE_AMPLITUDE = 4.0     # ノイズの振幅(m) - 細かな凹凸の高さ
+    NOISE_OCTAVES = 2         # ノイズのオクターブ数 - 細かさのレベル
+    NOISE_BASE_RES = 3        # ノイズの基本解像度
+    NOISE_PERSISTENCE = 0.5   # オクターブ間の減衰率
+    NOISE_BOUNDARY_FADE = 10.0  # 境界付近でノイズを減衰させる距離(px)
+    NOISE_GAUSSIAN_SIGMA = 0.5  # ノイズ適用後の平滑化強度
+
+    # === 可視化設定 ===
+    OUTPUT_DPI = 150          # 画像の解像度
+    FIGURE_WIDTH_2D = 16      # 2D可視化の幅
+    FIGURE_HEIGHT_2D = 8      # 2D可視化の高さ
+    FIGURE_WIDTH_3D = 2000    # 3D可視化の幅
+    FIGURE_HEIGHT_3D = 800    # 3D可視化の高さ
 
 print("ライブラリのインポート完了")
 
@@ -136,11 +199,23 @@ def generate_perlin_noise_2d(shape, res, octaves=4, persistence=0.5):
 
 
 class VoronoiTerrain:
-    def __init__(self, width=200, height=200, num_sites=200, num_groups=20):
-        self.width = width
-        self.height = height
-        self.num_sites = num_sites
-        self.num_groups = num_groups
+    def __init__(self, width=None, height=None, num_sites=None, num_groups=None, config=None):
+        """
+        地形生成クラス
+
+        Parameters:
+        - width: マップ幅(デフォルト: TerrainConfig.MAP_WIDTH)
+        - height: マップ高さ(デフォルト: TerrainConfig.MAP_HEIGHT)
+        - num_sites: Voronoi母点数(デフォルト: TerrainConfig.NUM_VORONOI_SITES)
+        - num_groups: グループ数(デフォルト: TerrainConfig.NUM_GROUPS)
+        - config: 設定クラス(デフォルト: TerrainConfig)
+        """
+        self.config = config or TerrainConfig
+
+        self.width = width or self.config.MAP_WIDTH
+        self.height = height or self.config.MAP_HEIGHT
+        self.num_sites = num_sites or self.config.NUM_VORONOI_SITES
+        self.num_groups = num_groups or self.config.NUM_GROUPS
 
         self.points = self._generate_relaxed_points()
         self.vor = Voronoi(self.points)
@@ -156,19 +231,23 @@ class VoronoiTerrain:
         # 境界の中央点を計算
         self._compute_boundary_centroids()
 
-        # 等距離線ベースの高度マップ(v6改善版)
+        # 等距離線ベースの高度マップ
         self.height_map = self._create_distance_based_height_map()
 
-        # v13: パーリンノイズで細かなディテールを追加
-        self.height_map = self.apply_perlin_noise_detail(self.height_map, amplitude=1.5, octaves=4)
+        # パーリンノイズで細かなディテールを追加
+        self.height_map = self.apply_perlin_noise_detail(
+            self.height_map,
+            amplitude=self.config.NOISE_AMPLITUDE,
+            octaves=self.config.NOISE_OCTAVES
+        )
 
-    def _generate_relaxed_points(self, iterations=3):
+    def _generate_relaxed_points(self):
         """Lloyd緩和でより均等な点配置"""
         points = np.random.rand(self.num_sites, 2)
         points[:, 0] *= self.width
         points[:, 1] *= self.height
 
-        for _ in range(iterations):
+        for _ in range(self.config.LLOYD_ITERATIONS):
             vor = Voronoi(points)
             centroids = []
 
@@ -400,19 +479,50 @@ class VoronoiTerrain:
 
         return group_centroids
 
+    def _adjust_probability_by_height(self, base_prob, current_height):
+        """現在の高度に基づいて上昇確率を調整
+
+        Parameters:
+        - base_prob: 基準となる上昇確率
+        - current_height: 現在の高度(m)
+
+        Returns:
+        - adjusted_prob: 調整後の上昇確率
+        """
+        # 高すぎる場合は上昇確率を下げる
+        if current_height >= self.config.HEIGHT_PROB_THRESHOLD_HIGH:
+            # 75m以上: 下降しやすくする(上昇確率を減らす)
+            adjustment = -self.config.HEIGHT_PROB_ADJUSTMENT
+        # 低すぎる場合は上昇確率を上げる
+        elif current_height <= self.config.HEIGHT_PROB_THRESHOLD_LOW:
+            # 25m以下: 上昇しやすくする(上昇確率を増やす)
+            adjustment = self.config.HEIGHT_PROB_ADJUSTMENT
+        else:
+            # 中間の高度では調整なし
+            adjustment = 0.0
+
+        # 確率を調整(0.0-1.0の範囲にクリップ)
+        adjusted_prob = np.clip(base_prob + adjustment, 0.0, 1.0)
+        return adjusted_prob
+
     def _propagate_heights(self):
         """グループごとに高度を伝播(基準点への距離に基づく方向決定)
 
-        v13改善: 左上の中心(width/4, height/4)を基準点として、近づく → 上昇70%、離れる → 下降70%
+        改善点:
+        - 領域の中心間距離に基づいて高度差を設定(0-40度の範囲)
+        - 通路で繋がった隣接領域の高度差を距離ベースで調整
         """
         # 基準点: 左上の中心
-        self.target_point = np.array([self.width / 4.0, self.height / 4.0])
+        self.target_point = np.array([
+            self.width * self.config.REFERENCE_POINT_X_RATIO,
+            self.height * self.config.REFERENCE_POINT_Y_RATIO
+        ])
 
         # 各グループの重心を計算
         group_centroids = self._compute_group_centroids()
 
         heights = {}
-        heights[0] = 40.0
+        heights[0] = self.config.INITIAL_HEIGHT
 
         visited = {0}
         queue = deque([0])
@@ -443,21 +553,40 @@ class VoronoiTerrain:
                 for i, (neighbor, neighbor_dist) in enumerate(neighbor_dists):
                     visited.add(neighbor)
 
-                    # 基準点に近づく場合は上昇70%、離れる場合は下降70%
+                    # 基準点に近づく/離れる場合の基準確率
                     if neighbor_dist < current_dist:
                         # 基準点に近づく → 上昇しやすい
-                        go_up = random.random() < 0.60
+                        base_prob = self.config.PROB_UP_APPROACHING
                     else:
                         # 基準点から離れる → 下降しやすい
-                        go_up = random.random() < 0.40
+                        base_prob = self.config.PROB_UP_RECEDING
 
-                    # 高度差: 1-2.5m
-                    height_diff = 1.0 + random.random() * 1.5
+                    # 現在の高度に基づいて確率を調整
+                    current_height = heights[current]
+                    adjusted_prob = self._adjust_probability_by_height(base_prob, current_height)
+
+                    # 調整された確率で上昇/下降を判定
+                    go_up = random.random() < adjusted_prob
+
+                    # 領域中心間の距離を計算
+                    centroid_distance = np.linalg.norm(
+                        group_centroids[current] - group_centroids[neighbor]
+                    )
+
+                    # 距離に基づいて高度差を計算(MIN_SLOPE_ANGLE-MAX_SLOPE_ANGLE度の範囲)
+                    # tan(angle) = height_diff / distance
+                    # ランダムな角度を設定範囲内で選択
+                    target_angle_deg = random.uniform(
+                        self.config.MIN_SLOPE_ANGLE,
+                        self.config.MAX_SLOPE_ANGLE
+                    )
+                    target_angle_rad = np.radians(target_angle_deg)
+                    height_diff = centroid_distance * np.tan(target_angle_rad)
 
                     if go_up:
-                        heights[neighbor] = min(80, heights[current] + height_diff)
+                        heights[neighbor] = min(self.config.MAX_HEIGHT, heights[current] + height_diff)
                     else:
-                        heights[neighbor] = max(20, heights[current] - height_diff)
+                        heights[neighbor] = max(self.config.MIN_HEIGHT, heights[current] - height_diff)
 
                     queue.append(neighbor)
 
@@ -469,21 +598,38 @@ class VoronoiTerrain:
                 # 隣接ノードの基準点からの距離
                 neighbor_dist = np.linalg.norm(group_centroids[neighbor] - self.target_point)
 
-                # 基準点に近づく場合は上昇70%、離れる場合は下降70%
+                # 基準点に近づく/離れる場合の基準確率
                 if neighbor_dist < current_dist:
                     # 基準点に近づく → 上昇しやすい
-                    go_up = random.random() < 0.70
+                    base_prob = self.config.PROB_UP_APPROACHING
                 else:
-                    # 中央から離れる → 下降しやすい
-                    go_up = random.random() < 0.30
+                    # 基準点から離れる → 下降しやすい
+                    base_prob = self.config.PROB_UP_RECEDING
 
-                # 高度差: 1-2.5m
-                height_diff = 1.0 + random.random() * 1.5
+                # 現在の高度に基づいて確率を調整
+                current_height = heights[current]
+                adjusted_prob = self._adjust_probability_by_height(base_prob, current_height)
+
+                # 調整された確率で上昇/下降を判定
+                go_up = random.random() < adjusted_prob
+
+                # 領域中心間の距離を計算
+                centroid_distance = np.linalg.norm(
+                    group_centroids[current] - group_centroids[neighbor]
+                )
+
+                # 距離に基づいて高度差を計算(MIN_SLOPE_ANGLE-MAX_SLOPE_ANGLE度の範囲)
+                target_angle_deg = random.uniform(
+                    self.config.MIN_SLOPE_ANGLE,
+                    self.config.MAX_SLOPE_ANGLE
+                )
+                target_angle_rad = np.radians(target_angle_deg)
+                height_diff = centroid_distance * np.tan(target_angle_rad)
 
                 if go_up:
-                    heights[neighbor] = min(80, heights[current] + height_diff)
+                    heights[neighbor] = min(self.config.MAX_HEIGHT, heights[current] + height_diff)
                 else:
-                    heights[neighbor] = max(20, heights[current] - height_diff)
+                    heights[neighbor] = max(self.config.MIN_HEIGHT, heights[current] - height_diff)
 
                 queue.append(neighbor)
 
@@ -492,6 +638,39 @@ class VoronoiTerrain:
         for i in range(self.num_groups):
             if i not in heights:
                 heights[i] = avg_height
+
+        # 通路で繋がった隣接領域の高度差を検証・調整(距離ベース)
+        for key, is_wall in self.is_wall.items():
+            if not is_wall:  # 通路(坂)の場合のみ
+                g1, g2 = key
+                if g1 in heights and g2 in heights:
+                    # 領域中心間の距離を計算
+                    centroid_distance = np.linalg.norm(
+                        group_centroids[g1] - group_centroids[g2]
+                    )
+
+                    # 現在の高度差から傾斜角度を計算
+                    current_height_diff = abs(heights[g1] - heights[g2])
+                    current_angle_rad = np.arctan(current_height_diff / centroid_distance)
+                    current_angle_deg = np.degrees(current_angle_rad)
+
+                    # MAX_SLOPE_ANGLEを超える場合は調整
+                    if current_angle_deg > self.config.MAX_SLOPE_ANGLE:
+                        # MAX_SLOPE_ANGLEに対応する高度差を計算
+                        max_height_diff = centroid_distance * np.tan(
+                            np.radians(self.config.MAX_SLOPE_ANGLE)
+                        )
+
+                        # 高度差を調整(比率を保ちながら縮小)
+                        avg = (heights[g1] + heights[g2]) / 2.0
+                        adjustment = max_height_diff / 2.0
+
+                        if heights[g1] > heights[g2]:
+                            heights[g1] = avg + adjustment
+                            heights[g2] = avg - adjustment
+                        else:
+                            heights[g1] = avg - adjustment
+                            heights[g2] = avg + adjustment
 
         return heights
 
@@ -576,12 +755,13 @@ class VoronoiTerrain:
                 self.boundary_centroids[key] = (centroid_x, centroid_y)
 
     def _create_distance_based_height_map(self):
-        """等距離線ベースの高度マップ生成(v6改善版)
+        """等距離線ベースの高度マップ生成(改善版)
 
-        改善アルゴリズム:
-        1. 中央平坦化: 境界から遠い場所(30ピクセル以上)は完全に平坦
-        2. 緩やかな坂: 30-50ピクセル距離で高度変化、10-20度の緩やかな傾斜
-        3. 滑らかな角度補間: 境界間の角度変化を連続的に補正
+        アルゴリズム:
+        1. 各境界の影響を角度と距離で重み付け
+        2. すべての境界の影響を滑らかに混合
+        3. 崖は急激、坂は緩やか、という特性を距離関数で表現
+        4. 領域内で段差が発生しないよう滑らかに補間
         """
         height_map = np.zeros((self.height, self.width))
 
@@ -604,8 +784,8 @@ class VoronoiTerrain:
                 # 境界までの最小距離を取得
                 dist_to_any_boundary = self.distance_to_boundary.get(current_group, {}).get((x, y), float('inf'))
 
-                # === 中央平坦化: 境界から30ピクセル以上離れている場合は完全平坦 ===
-                if dist_to_any_boundary >= 30.0:
+                # 中央平坦化: 境界から一定距離以上離れている場合は完全平坦
+                if dist_to_any_boundary >= self.config.FLAT_CENTER_DISTANCE:
                     height_map[y, x] = base_height
                     continue
 
@@ -624,8 +804,9 @@ class VoronoiTerrain:
                     height_map[y, x] = base_height
                     continue
 
-                # === ステップ1: 最も近い境界方向を特定(主境界) ===
-                boundary_info = []
+                # === すべての境界の影響を計算 ===
+                total_weight = 0.0
+                weighted_height_sum = 0.0
 
                 for neighbor_id, pixel_distances in dist_field.items():
                     dist_to_this_boundary = pixel_distances.get((x, y), float('inf'))
@@ -650,126 +831,66 @@ class VoronoiTerrain:
                     cos_angle = np.dot(pixel_vec, boundary_vec) / (pixel_norm * boundary_norm)
                     cos_angle = np.clip(cos_angle, -1.0, 1.0)
 
-                    # 情報を保存
-                    boundary_info.append({
-                        'neighbor_id': neighbor_id,
-                        'distance': dist_to_this_boundary,
-                        'cos_angle': cos_angle,
-                        'key': key
-                    })
+                    # 負の角度（90度以上離れている）は無視
+                    if cos_angle < 0.0:
+                        continue
 
-                if not boundary_info:
-                    height_map[y, x] = base_height
-                    continue
+                    # 壁かどうかを判定
+                    is_wall = self.is_wall.get(key, True)
+                    neighbor_height = self.group_heights[neighbor_id]
 
-                # cos_angleが最大(方向が最も一致)の境界を主境界とする
-                boundary_info.sort(key=lambda b: b['cos_angle'], reverse=True)
-                primary_boundary = boundary_info[0]
+                    # 距離に基づく影響度を計算
+                    if is_wall:
+                        # 崖: 狭い範囲で急激に変化
+                        if dist_to_this_boundary < self.config.CLIFF_RANGE:
+                            t = dist_to_this_boundary / self.config.CLIFF_RANGE
+                            influence = 1.0 - (t ** self.config.CLIFF_POWER)
+                        else:
+                            influence = 0.0
 
-                # 主境界のcos_angleが負(90度以上離れている)場合は影響なし
-                if primary_boundary['cos_angle'] < 0.0:
-                    height_map[y, x] = base_height
-                    continue
-
-                # === ステップ2: 主境界までの距離で高度を計算 ===
-                primary_key = primary_boundary['key']
-                is_wall = self.is_wall.get(primary_key, True)
-                neighbor_height = self.group_heights[primary_boundary['neighbor_id']]
-                distance = primary_boundary['distance']
-
-                if is_wall:
-                    # 崖: 境界から20ピクセル以内で急激に変化
-                    cliff_range = 20.0
-                    if distance < cliff_range:
-                        t = distance / cliff_range
-                        # べき乗0.25 = 非常に急峻(境界でストンと落ちる)
-                        blend = 1.0 - (t ** 0.25)
+                        # 崖は高い側から低い側へのみ影響
+                        if base_height > neighbor_height:
+                            target_height = neighbor_height
+                        else:
+                            # 低い側は影響を受けない
+                            influence = 0.0
+                            target_height = base_height
                     else:
-                        # 崖の範囲外: ベース高度を保つ
-                        blend = 0.0
+                        # 坂: 広い範囲で緩やかに変化
+                        if dist_to_this_boundary < self.config.SLOPE_RANGE:
+                            t = dist_to_this_boundary / self.config.SLOPE_RANGE
+                            influence = 1.0 - (t ** self.config.SLOPE_POWER)
+                        else:
+                            influence = 0.0
 
-                    # 壁: 高い側だけが低い方に向かって下がる
-                    if base_height > neighbor_height:
-                        # 高い側 → 低い方へ下がる
-                        target_height = neighbor_height
-                        primary_height = base_height * (1.0 - blend) + target_height * blend
-                    else:
-                        # 低い側 → 変化なし(上がらない)
-                        primary_height = base_height
+                        # 坂は中間高度に向かう
+                        target_height = (base_height + neighbor_height) / 2.0
+
+                    # 角度による重み付け（方向が一致するほど強い影響）
+                    # cos_angleを2乗することで、より方向が一致する境界を優先
+                    angle_weight = cos_angle ** 2
+
+                    # 最終的な重み = 距離による影響度 × 角度による重み
+                    weight = influence * angle_weight
+
+                    if weight > 0.0:
+                        weighted_height_sum += target_height * weight
+                        total_weight += weight
+
+                # 重み付き平均で最終高度を計算
+                if total_weight > 0.0:
+                    # すべての境界の影響を滑らかに混合
+                    influenced_height = weighted_height_sum / total_weight
+                    # ベース高度と影響を受けた高度を混合
+                    final_height = base_height * (1.0 - total_weight) + influenced_height * total_weight
+                    height_map[y, x] = final_height
                 else:
-                    # 坂: 境界から30-50ピクセルで緩やかに変化(10-20度の坂)
-                    slope_range = 50.0
-                    if distance < slope_range:
-                        t = distance / slope_range
-                        # べき乗1.2 = 非常に緩やか(ほぼ線形、境界付近だけ少し変化)
-                        blend = 1.0 - (t ** 1.2)
-                    else:
-                        # 坂の範囲外
-                        blend = 0.0
-
-                    # 坂: 両側が境界の中間高度に向かう
-                    boundary_height = (base_height + neighbor_height) / 2.0
-                    primary_height = base_height * (1.0 - blend) + boundary_height * blend
-
-                # === ステップ3: 滑らかな角度補間(角度変化を連続的に補正) ===
-                final_height = primary_height
-
-                if len(boundary_info) > 1:
-                    # 2番目に近い境界との中間点で補間
-                    secondary_boundary = boundary_info[1]
-
-                    # 両境界のcos_angleが正(影響範囲内)の場合のみ補間
-                    if secondary_boundary['cos_angle'] > 0.0:
-                        # 角度差による補間の強度を調整
-                        # 角度が近い場合は強く補間、離れている場合は弱く補間
-                        angle_diff = abs(primary_boundary['cos_angle'] - secondary_boundary['cos_angle'])
-
-                        # 角度差が小さい(0.5未満)場合のみ補間を適用
-                        if angle_diff < 0.5:
-                            # 2つの境界への角度の比で重み付け(滑らかに)
-                            angle_sum = primary_boundary['cos_angle'] + secondary_boundary['cos_angle']
-                            weight_primary = primary_boundary['cos_angle'] / angle_sum
-                            weight_secondary = secondary_boundary['cos_angle'] / angle_sum
-
-                            # 角度差に応じて補間の強度を減衰
-                            interpolation_strength = 1.0 - (angle_diff / 0.5)
-
-                            # 2番目の境界の高度計算
-                            secondary_key = secondary_boundary['key']
-                            secondary_is_wall = self.is_wall.get(secondary_key, True)
-                            secondary_neighbor_height = self.group_heights[secondary_boundary['neighbor_id']]
-                            secondary_distance = secondary_boundary['distance']
-
-                            if secondary_is_wall:
-                                if secondary_distance < 20.0:
-                                    t = secondary_distance / 20.0
-                                    sec_blend = 1.0 - (t ** 0.25)
-                                else:
-                                    sec_blend = 0.0
-
-                                if base_height > secondary_neighbor_height:
-                                    secondary_height = base_height * (1.0 - sec_blend) + secondary_neighbor_height * sec_blend
-                                else:
-                                    secondary_height = base_height
-                            else:
-                                if secondary_distance < 50.0:
-                                    t = secondary_distance / 50.0
-                                    sec_blend = 1.0 - (t ** 1.2)
-                                else:
-                                    sec_blend = 0.0
-
-                                sec_boundary_height = (base_height + secondary_neighbor_height) / 2.0
-                                secondary_height = base_height * (1.0 - sec_blend) + sec_boundary_height * sec_blend
-
-                            # 補間の強度に応じて滑らかに混ぜる
-                            interpolated_height = primary_height * weight_primary + secondary_height * weight_secondary
-                            final_height = primary_height * (1.0 - interpolation_strength) + interpolated_height * interpolation_strength
-
-                height_map[y, x] = final_height
+                    # どの境界からも影響を受けない場合はベース高度
+                    height_map[y, x] = base_height
 
         return height_map
 
-    def apply_perlin_noise_detail(self, height_map, amplitude=1.5, octaves=4):
+    def apply_perlin_noise_detail(self, height_map, amplitude, octaves):
         """
         高度マップにパーリンノイズによる細かなディテールを追加
 
@@ -784,9 +905,9 @@ class VoronoiTerrain:
         # パーリンノイズ生成
         noise = generate_perlin_noise_2d(
             shape=(self.height, self.width),
-            res=(3, 3),  # 基本周波数
+            res=(self.config.NOISE_BASE_RES, self.config.NOISE_BASE_RES),
             octaves=octaves,
-            persistence=0.5
+            persistence=self.config.NOISE_PERSISTENCE
         )
 
         # ノイズを [-amplitude, amplitude] の範囲にスケール
@@ -800,16 +921,16 @@ class VoronoiTerrain:
                 # 境界までの最小距離を取得
                 dist_to_boundary = self.distance_to_boundary.get(current_group, {}).get((x, y), 0.0)
 
-                # 境界から10ピクセル以内ではノイズを減衰
-                if dist_to_boundary < 10.0:
-                    noise_strength = dist_to_boundary / 10.0
+                # 境界から一定距離以内ではノイズを減衰
+                if dist_to_boundary < self.config.NOISE_BOUNDARY_FADE:
+                    noise_strength = dist_to_boundary / self.config.NOISE_BOUNDARY_FADE
                     noise[y, x] *= noise_strength
 
         # ノイズを適用
         height_map_with_noise = height_map + noise
 
         # ガウシアンフィルタで軽く滑らかに
-        height_map_with_noise = gaussian_filter(height_map_with_noise, sigma=0.5)
+        height_map_with_noise = gaussian_filter(height_map_with_noise, sigma=self.config.NOISE_GAUSSIAN_SIGMA)
 
         return height_map_with_noise
 
@@ -838,8 +959,8 @@ def visualize_2d(terrain):
             centroid_y = np.mean(y_coords)
             group_centroids[group_id] = (centroid_x, centroid_y)
 
-    # グループ構造の可視化(改善版)
-    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    # グループ構造の可視化
+    fig, axes = plt.subplots(1, 2, figsize=(TerrainConfig.FIGURE_WIDTH_2D, TerrainConfig.FIGURE_HEIGHT_2D))
 
     # === 左: グループマップ(高さと境界種別を表示)===
     ax1 = axes[0]
@@ -984,8 +1105,8 @@ def visualize_2d(terrain):
     plt.colorbar(im2, ax=ax2, label='高度 (m)')
 
     plt.tight_layout()
-    plt.savefig('terrain_2d_v13.png', dpi=150, bbox_inches='tight')
-    print("2D可視化を保存: terrain_2d_v13.png")
+    plt.savefig('terrain_2d.png', dpi=TerrainConfig.OUTPUT_DPI, bbox_inches='tight')
+    print("2D可視化を保存: terrain_2d.png")
     plt.show()
 
 
@@ -1015,24 +1136,31 @@ def visualize_3d(terrain):
         hovertemplate='X: %{x}<br>Y: %{y}<br>Height: %{z:.1f}m<extra></extra>'
     )])
 
+    # 高度の範囲を取得して適切なスケールを計算
+    height_range = terrain.height_map.max() - terrain.height_map.min()
+
+    # 水平方向のスケールに合わせてZ軸の比率を計算
+    # マップサイズ(400x400)に対する高度範囲の比率
+    z_ratio = height_range / terrain.width
+
     fig.update_layout(
-        title='Surface Mesh Terrain (Interactive 3D) - v13改善版',
+        title='Surface Mesh Terrain (Interactive 3D)',
         scene=dict(
-            xaxis_title='X',
-            yaxis_title='Y',
+            xaxis_title='X (px)',
+            yaxis_title='Y (px)',
             zaxis_title='Height (m)',
             aspectmode='manual',
-            aspectratio=dict(x=2, y=2, z=1),
+            aspectratio=dict(x=1, y=1, z=z_ratio),
             camera=dict(
                 eye=dict(x=1.5, y=1.5, z=1.2)
             )
         ),
-        width=2000,
-        height=800
+        width=TerrainConfig.FIGURE_WIDTH_3D,
+        height=TerrainConfig.FIGURE_HEIGHT_3D
     )
 
-    fig.write_html('terrain_3d_v13.html')
-    print("3D可視化を保存: terrain_3d_v13.html")
+    fig.write_html('terrain_3d.html')
+    print("3D可視化を保存: terrain_3d.html")
     fig.show()
 
 
@@ -1108,7 +1236,6 @@ def print_statistics(terrain):
 
     moderate = np.sum((angles >= 10) & (angles < 20))
     print(f"\n10-20度の緩やかな坂: {moderate} ピクセル ({moderate/total*100:.1f}%)")
-    print(f"✅ v13改善: 4倍マップ、左上中心を基準点(赤星)、基準点に近づく→上昇")
 
 
 def visualize_slope_angles(terrain):
@@ -1137,19 +1264,19 @@ def visualize_slope_angles(terrain):
     plt.grid(axis='y', alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig('terrain_slope_angles_v13.png', dpi=150, bbox_inches='tight')
-    print("傾斜角度可視化を保存: terrain_slope_angles_v13.png")
+    plt.savefig('terrain_slope_angles.png', dpi=TerrainConfig.OUTPUT_DPI, bbox_inches='tight')
+    print("傾斜角度可視化を保存: terrain_slope_angles.png")
     plt.show()
 
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("ボクセルベース地形生成(改善版v13)")
+    print("ボクセルベース地形生成")
     print("=" * 60)
 
-    # 地形を生成(v13: マップを4倍に拡張、母点・グループも4倍)
+    # 地形を生成
     print("\n地形を生成中...")
-    terrain = VoronoiTerrain(width=400, height=400, num_sites=800, num_groups=80)
+    terrain = VoronoiTerrain()
 
     print(f"\n生成完了:")
     print(f"  - セル数: {terrain.num_sites}")
@@ -1167,7 +1294,7 @@ if __name__ == "__main__":
 
     print("\n" + "=" * 60)
     print("完了!生成されたファイル:")
-    print("  - terrain_2d_v13.png (2D可視化)")
-    print("  - terrain_slope_angles_v13.png (傾斜角度)")
-    print("  - terrain_3d_v13.html (インタラクティブ3D)")
+    print("  - terrain_2d.png (2D可視化)")
+    print("  - terrain_slope_angles.png (傾斜角度)")
+    print("  - terrain_3d.html (インタラクティブ3D)")
     print("=" * 60)
