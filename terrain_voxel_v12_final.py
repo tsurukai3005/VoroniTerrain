@@ -38,6 +38,10 @@ class TerrainConfig:
     # === Lloyd緩和設定 ===
     LLOYD_ITERATIONS = 3      # Lloyd緩和の反復回数(均等な点配置のため)
 
+    # === 母点分布の疎密制御 ===
+    CLUSTERING_STRENGTH = 0.0  # 0.0=均一分散, 1.0=強く密集
+    CLUSTERING_SCALE = 100.0   # クラスタリングの空間スケール(px)
+
     # === 高度設定 ===
     INITIAL_HEIGHT = 40.0     # 初期高度(m)
     MIN_HEIGHT = 20.0         # 最低高度(m)
@@ -60,7 +64,7 @@ class TerrainConfig:
     HEIGHT_PROB_ADJUSTMENT = 0.30      # 確率調整の幅(±30%)
 
     # === 傾斜角度設定 ===
-    MAX_SLOPE_ANGLE = 30.0    # 坂の最大傾斜角度(度)
+    MAX_SLOPE_ANGLE = 40.0    # 坂の最大傾斜角度(度)
     MIN_SLOPE_ANGLE = 0.0     # 坂の最小傾斜角度(度)
 
     # === 境界距離設定 ===
@@ -75,12 +79,12 @@ class TerrainConfig:
     SLOPE_POWER = 1.5         # 坂の変化曲線(べき乗) - 大きいほど緩やか
 
     # === パーリンノイズ設定 ===
-    NOISE_AMPLITUDE = 4.0     # ノイズの振幅(m) - 細かな凹凸の高さ
-    NOISE_OCTAVES = 2         # ノイズのオクターブ数 - 細かさのレベル
-    NOISE_BASE_RES = 3        # ノイズの基本解像度
-    NOISE_PERSISTENCE = 0.5   # オクターブ間の減衰率
-    NOISE_BOUNDARY_FADE = 10.0  # 境界付近でノイズを減衰させる距離(px)
-    NOISE_GAUSSIAN_SIGMA = 0.5  # ノイズ適用後の平滑化強度
+    NOISE_AMPLITUDE = 8.0     # ノイズの振幅(m) - 細かな凹凸の高さ
+    NOISE_OCTAVES = 4         # ノイズのオクターブ数 - 細かさのレベル
+    NOISE_BASE_RES = 8        # ノイズの基本解像度
+    NOISE_PERSISTENCE = 0.6   # オクターブ間の減衰率
+    NOISE_BOUNDARY_FADE = 5.0  # 境界付近でノイズを減衰させる距離(px)
+    NOISE_GAUSSIAN_SIGMA = 0.3  # ノイズ適用後の平滑化強度 (0.5→0.3で改善)
 
     # === 可視化設定 ===
     OUTPUT_DPI = 150          # 画像の解像度
@@ -242,28 +246,102 @@ class VoronoiTerrain:
         )
 
     def _generate_relaxed_points(self):
-        """Lloyd緩和でより均等な点配置"""
-        points = np.random.rand(self.num_sites, 2)
-        points[:, 0] *= self.width
-        points[:, 1] *= self.height
+        """Lloyd緩和でより均等な点配置、または疎密制御による偏った配置
 
-        for _ in range(self.config.LLOYD_ITERATIONS):
-            vor = Voronoi(points)
-            centroids = []
+        CLUSTERING_STRENGTH = 0.0: 完全均一分散（Lloyd緩和）
+        CLUSTERING_STRENGTH = 1.0: 強く密集した分布
+        """
+        clustering = self.config.CLUSTERING_STRENGTH
 
-            for i, region_idx in enumerate(vor.point_region):
-                region = vor.regions[region_idx]
-                if -1 in region or len(region) == 0:
-                    centroids.append(points[i])
-                    continue
+        if clustering <= 0.0:
+            # 従来通りの均一分散（Lloyd緩和）
+            points = np.random.rand(self.num_sites, 2)
+            points[:, 0] *= self.width
+            points[:, 1] *= self.height
 
-                vertices = vor.vertices[region]
-                centroid = vertices.mean(axis=0)
-                centroid[0] = np.clip(centroid[0], 0, self.width)
-                centroid[1] = np.clip(centroid[1], 0, self.height)
-                centroids.append(centroid)
+            for _ in range(self.config.LLOYD_ITERATIONS):
+                vor = Voronoi(points)
+                centroids = []
 
-            points = np.array(centroids)
+                for i, region_idx in enumerate(vor.point_region):
+                    region = vor.regions[region_idx]
+                    if -1 in region or len(region) == 0:
+                        centroids.append(points[i])
+                        continue
+
+                    vertices = vor.vertices[region]
+                    centroid = vertices.mean(axis=0)
+                    centroid[0] = np.clip(centroid[0], 0, self.width)
+                    centroid[1] = np.clip(centroid[1], 0, self.height)
+                    centroids.append(centroid)
+
+                points = np.array(centroids)
+        else:
+            # 疎密制御による分布
+            # パーリンノイズで密度マップを生成
+            density_res = max(2, int(min(self.width, self.height) / self.config.CLUSTERING_SCALE))
+            density_map = generate_perlin_noise_2d(
+                shape=(self.height, self.width),
+                res=(density_res, density_res),
+                octaves=3,
+                persistence=0.5
+            )
+
+            # 密度マップを0-1に正規化
+            density_map = (density_map - density_map.min()) / (density_map.max() - density_map.min())
+
+            # clustering strengthで均一分布と密度ベース分布を混合
+            uniform_points = np.random.rand(self.num_sites, 2)
+            uniform_points[:, 0] *= self.width
+            uniform_points[:, 1] *= self.height
+
+            # 密度ベースのポイント生成（rejection sampling）
+            clustered_points = []
+            max_attempts = self.num_sites * 100
+            attempts = 0
+
+            while len(clustered_points) < self.num_sites and attempts < max_attempts:
+                x = int(np.random.rand() * self.width)
+                y = int(np.random.rand() * self.height)
+                x = np.clip(x, 0, self.width - 1)
+                y = np.clip(y, 0, self.height - 1)
+
+                # 密度マップの値に基づいて受理
+                if np.random.rand() < density_map[y, x]:
+                    clustered_points.append([x, y])
+
+                attempts += 1
+
+            # 不足分は均一分布で補完
+            while len(clustered_points) < self.num_sites:
+                x = np.random.rand() * self.width
+                y = np.random.rand() * self.height
+                clustered_points.append([x, y])
+
+            clustered_points = np.array(clustered_points[:self.num_sites])
+
+            # clustering strengthで混合
+            points = (1.0 - clustering) * uniform_points + clustering * clustered_points
+
+            # Lloyd緩和を弱めに適用（clustering強度に応じて）
+            lloyd_iters = int(self.config.LLOYD_ITERATIONS * (1.0 - clustering))
+            for _ in range(lloyd_iters):
+                vor = Voronoi(points)
+                centroids = []
+
+                for i, region_idx in enumerate(vor.point_region):
+                    region = vor.regions[region_idx]
+                    if -1 in region or len(region) == 0:
+                        centroids.append(points[i])
+                        continue
+
+                    vertices = vor.vertices[region]
+                    centroid = vertices.mean(axis=0)
+                    centroid[0] = np.clip(centroid[0], 0, self.width)
+                    centroid[1] = np.clip(centroid[1], 0, self.height)
+                    centroids.append(centroid)
+
+                points = np.array(centroids)
 
         return points
 
